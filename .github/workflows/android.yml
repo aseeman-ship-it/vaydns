@@ -1,0 +1,36 @@
+name: android-build
+on: workflow_dispatch
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - abi: arm64-v8a
+            goarch: arm64
+            cc: aarch64-linux-android24-clang
+          - abi: armeabi-v7a
+            goarch: arm
+            goarm: "7"
+            cc: armv7a-linux-androideabi24-clang
+          - abi: x86_64
+            goarch: amd64
+            cc: x86_64-linux-android24-clang
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Build
+        run: |
+          TC=$ANDROID_NDK_LATEST_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin
+          mkdir -p out/${{ matrix.abi }}
+          CGO_ENABLED=1 GOOS=android GOARCH=${{ matrix.goarch }} GOARM=${{ matrix.goarm }} \
+          CC=$TC/${{ matrix.cc }} \
+          go build -trimpath -ldflags="-s -w" \
+            -o out/${{ matrix.abi }}/libvaydns.so ./vaydns-client
+      - uses: actions/upload-artifact@v4
+        with:
+          name: libvaydns-${{ matrix.abi }}
+          path: out/${{ matrix.abi }}/libvaydns.so
