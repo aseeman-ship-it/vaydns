@@ -133,7 +133,26 @@ jobs:
           export PKG_CONFIG_ALLOW_CROSS=1
           export PKG_CONFIG_LIBDIR="$OSSL_LIBDIR/pkgconfig"
           export PKG_CONFIG_PATH="$OSSL_LIBDIR/pkgconfig"
-          cargo ndk -t "${{ matrix.abi }}" -p "${ANDROID_API}" build --release -p slipstream-client
+          LOG="$GITHUB_WORKSPACE/build-${{ matrix.abi }}.log"
+          set +e
+          cargo ndk -t "${{ matrix.abi }}" -p "${ANDROID_API}" build --release -p slipstream-client > "$LOG" 2>&1
+          RC=$?
+          set -e
+          echo "cargo exit code: $RC"
+          if [ "$RC" -ne 0 ]; then
+            echo "::error::cargo build failed - the real error is printed below (environment dump removed)"
+            grep -v -E '^ +[A-Za-z_][A-Za-z_0-9]*="' "$LOG" | tail -n 150
+            exit "$RC"
+          fi
+          tail -n 5 "$LOG"
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: slipstream-log-${{ matrix.abi }}
+          path: build-${{ matrix.abi }}.log
+          if-no-files-found: ignore
 
       - name: Package libslipstream.so
         run: |
