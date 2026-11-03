@@ -105,7 +105,7 @@ jobs:
           tar xzf openssl.tar.gz
           cd "openssl-${OPENSSL_VERSION}"
           ./Configure "${{ matrix.ossl }}" -D__ANDROID_API__="${ANDROID_API}" \
-            no-shared no-tests no-docs --prefix="$PREFIX" --openssldir="$PREFIX/ssl"
+            no-shared no-tests --prefix="$PREFIX" --openssldir="$PREFIX/ssl"
           make -j"$(nproc)" build_libs
           make install_dev
           LIBSSL="$(find "$PREFIX" -name libssl.a | head -1)"
