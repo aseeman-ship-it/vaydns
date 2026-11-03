@@ -1,0 +1,233 @@
+name: Build Last Net cores (Slipstream + Soar)
+
+# Put this file at: .github/workflows/build-cores.yml
+# Run it from the Actions tab -> "Build Last Net cores" -> Run workflow.
+# Each job uploads one artifact per ABI containing libslipstream.so / libsoar.so
+# (these are executables named *.so so Android extracts them into nativeLibraryDir).
+
+on:
+  workflow_dispatch:
+    inputs:
+      slipstream_repo:
+        description: "Slipstream (Rust) repo"
+        default: "Mygod/slipstream-rust"
+      slipstream_ref:
+        description: "Slipstream branch / tag / commit"
+        default: "main"
+      soar_repo:
+        description: "Repo that contains the Soar CLI client (Go)"
+        default: "WhiteDNS/WhiteDNS-Android"
+      soar_ref:
+        description: "Soar repo branch / tag / commit"
+        default: "main"
+      soar_dir:
+        description: "Folder inside that repo that holds the Soar engine (leave 'soar-engine' if unsure)"
+        default: "soar-engine"
+      soar_pkg:
+        description: "Go main package to build (empty = auto-detect the first main package)"
+        default: ""
+
+env:
+  ANDROID_API: "24"
+  NDK_VERSION: "r27c"
+  OPENSSL_VERSION: "3.0.15"
+
+jobs:
+  # ---------------------------------------------------------------- Slipstream
+  slipstream:
+    name: slipstream ${{ matrix.abi }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - abi: arm64-v8a
+            rust: aarch64-linux-android
+            ossl: android-arm64
+          - abi: armeabi-v7a
+            rust: armv7-linux-androideabi
+            ossl: android-arm
+          - abi: x86_64
+            rust: x86_64-linux-android
+            ossl: android-x86_64
+    steps:
+      - name: Checkout slipstream-rust (with picoquic submodule)
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.slipstream_repo }}
+          ref: ${{ inputs.slipstream_ref }}
+          submodules: recursive
+          path: src
+
+      - name: Install Android NDK
+        id: ndk
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: ${{ env.NDK_VERSION }}
+          add-to-path: false
+
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends cmake pkg-config perl make python3 file
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust }}
+
+      - name: Install cargo-ndk
+        run: cargo install cargo-ndk --locked
+
+      - name: Build static OpenSSL for ${{ matrix.abi }}
+        run: |
+          set -euxo pipefail
+          export ANDROID_NDK_ROOT="${{ steps.ndk.outputs.ndk-path }}"
+          export ANDROID_NDK_HOME="$ANDROID_NDK_ROOT"
+          export PATH="$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin:$PATH"
+          PREFIX="$RUNNER_TEMP/openssl-${{ matrix.abi }}"
+          cd "$RUNNER_TEMP"
+          curl -fsSL "https://github.com/openssl/openssl/releases/download/openssl-${OPENSSL_VERSION}/openssl-${OPENSSL_VERSION}.tar.gz" -o openssl.tar.gz
+          tar xzf openssl.tar.gz
+          cd "openssl-${OPENSSL_VERSION}"
+          ./Configure "${{ matrix.ossl }}" -D__ANDROID_API__="${ANDROID_API}" \
+            no-shared no-tests no-docs --prefix="$PREFIX" --openssldir="$PREFIX/ssl"
+          make -j"$(nproc)" build_libs
+          make install_dev
+          LIBSSL="$(find "$PREFIX" -name libssl.a | head -1)"
+          test -n "$LIBSSL"
+          echo "OSSL_PREFIX=$PREFIX" >> "$GITHUB_ENV"
+          echo "OSSL_LIBDIR=$(dirname "$LIBSSL")" >> "$GITHUB_ENV"
+
+      - name: Build slipstream-client
+        working-directory: src
+        run: |
+          set -euxo pipefail
+          export ANDROID_NDK_HOME="${{ steps.ndk.outputs.ndk-path }}"
+          export ANDROID_NDK_ROOT="$ANDROID_NDK_HOME"
+          export ANDROID_ABI="${{ matrix.abi }}"
+          export ANDROID_PLATFORM="android-${ANDROID_API}"
+          export CMAKE_TOOLCHAIN_FILE="$ANDROID_NDK_HOME/build/cmake/android.toolchain.cmake"
+          # Use only our own OpenSSL, never the host one.
+          export OPENSSL_DIR="$OSSL_PREFIX"
+          export OPENSSL_STATIC=1
+          export OPENSSL_LIB_DIR="$OSSL_LIBDIR"
+          export OPENSSL_INCLUDE_DIR="$OSSL_PREFIX/include"
+          export OPENSSL_ROOT_DIR="$OSSL_PREFIX"
+          export OPENSSL_SSL_LIBRARY="$OSSL_LIBDIR/libssl.a"
+          export OPENSSL_CRYPTO_LIBRARY="$OSSL_LIBDIR/libcrypto.a"
+          export PKG_CONFIG_ALLOW_CROSS=1
+          export PKG_CONFIG_LIBDIR="$OSSL_LIBDIR/pkgconfig"
+          export PKG_CONFIG_PATH="$OSSL_LIBDIR/pkgconfig"
+          cargo ndk -t "${{ matrix.abi }}" -p "${ANDROID_API}" build --release -p slipstream-client
+
+      - name: Package libslipstream.so
+        run: |
+          set -euxo pipefail
+          BIN="src/target/${{ matrix.rust }}/release/slipstream-client"
+          test -f "$BIN"
+          mkdir -p "out/${{ matrix.abi }}"
+          cp "$BIN" "out/${{ matrix.abi }}/libslipstream.so"
+          "${{ steps.ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip" "out/${{ matrix.abi }}/libslipstream.so"
+          file "out/${{ matrix.abi }}/libslipstream.so"
+          ls -l "out/${{ matrix.abi }}"
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: slipstream-${{ matrix.abi }}
+          path: out/${{ matrix.abi }}/libslipstream.so
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------- Soar
+  soar:
+    name: soar ${{ matrix.abi }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - abi: arm64-v8a
+            goarch: arm64
+            clang: aarch64-linux-android
+          - abi: armeabi-v7a
+            goarch: arm
+            clang: armv7a-linux-androideabi
+          - abi: x86_64
+            goarch: amd64
+            clang: x86_64-linux-android
+    steps:
+      - name: Checkout Soar sources
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.soar_repo }}
+          ref: ${{ inputs.soar_ref }}
+          submodules: recursive
+          path: src
+
+      - name: Install Android NDK
+        id: ndk
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: ${{ env.NDK_VERSION }}
+          add-to-path: false
+
+      - name: Install Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+          cache: false
+
+      - name: Locate Go module and main package
+        id: find
+        run: |
+          set -euxo pipefail
+          cd src
+          GOMOD="$(find "${{ inputs.soar_dir }}" -maxdepth 3 -name go.mod | head -1)"
+          if [ -z "$GOMOD" ]; then
+            echo "::error::No go.mod found under '${{ inputs.soar_dir }}'. Set the soar_dir input to the folder that holds the Soar client."
+            find . -name go.mod -not -path './.git/*' | head -20
+            exit 1
+          fi
+          MODDIR="$(dirname "$GOMOD")"
+          cd "$MODDIR"
+          PKG="${{ inputs.soar_pkg }}"
+          if [ -z "$PKG" ]; then
+            PKG="$(go list -f '{{if eq .Name "main"}}{{.ImportPath}}{{end}}' ./... | grep -v -E '/(test|tests|bench|examples?|tools?)(/|$)' | head -1)"
+          fi
+          if [ -z "$PKG" ]; then
+            echo "::error::No main package found in $MODDIR"
+            go list ./... || true
+            exit 1
+          fi
+          echo "Using module dir: $MODDIR"
+          echo "Using package:   $PKG"
+          echo "moddir=$MODDIR" >> "$GITHUB_OUTPUT"
+          echo "pkg=$PKG" >> "$GITHUB_OUTPUT"
+
+      - name: Build libsoar.so
+        run: |
+          set -euxo pipefail
+          TOOLBIN="${{ steps.ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          export CC="$TOOLBIN/${{ matrix.clang }}${ANDROID_API}-clang"
+          export CXX="$TOOLBIN/${{ matrix.clang }}${ANDROID_API}-clang++"
+          test -x "$CC"
+          export GOOS=android
+          export GOARCH="${{ matrix.goarch }}"
+          export CGO_ENABLED=1
+          if [ "$GOARCH" = "arm" ]; then export GOARM=7; fi
+          mkdir -p "$GITHUB_WORKSPACE/out/${{ matrix.abi }}"
+          cd "src/${{ steps.find.outputs.moddir }}"
+          go build -trimpath -ldflags "-s -w" \
+            -o "$GITHUB_WORKSPACE/out/${{ matrix.abi }}/libsoar.so" \
+            "${{ steps.find.outputs.pkg }}"
+          file "$GITHUB_WORKSPACE/out/${{ matrix.abi }}/libsoar.so"
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: soar-${{ matrix.abi }}
+          path: out/${{ matrix.abi }}/libsoar.so
+          if-no-files-found: error
