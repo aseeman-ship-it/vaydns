@@ -135,7 +135,7 @@ jobs:
           export PKG_CONFIG_PATH="$OSSL_LIBDIR/pkgconfig"
           LOG="$GITHUB_WORKSPACE/build-${{ matrix.abi }}.log"
           set +e
-          cargo ndk -t "${{ matrix.abi }}" -p "${ANDROID_API}" build --release -p slipstream-client > "$LOG" 2>&1
+          cargo ndk -t "${{ matrix.abi }}" --platform "${ANDROID_API}" build --release -p slipstream-client > "$LOG" 2>&1
           RC=$?
           set -e
           echo "cargo exit code: $RC"
