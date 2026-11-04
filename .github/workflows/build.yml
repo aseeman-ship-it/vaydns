@@ -143,6 +143,29 @@ jobs:
           export "CC_${TRIPLE_ENV}=$TOOLBIN/${{ matrix.clang }}${ANDROID_API}-clang"
           export "CXX_${TRIPLE_ENV}=$TOOLBIN/${{ matrix.clang }}${ANDROID_API}-clang++"
           export "AR_${TRIPLE_ENV}=$TOOLBIN/llvm-ar"
+          # slipstream-ffi/build.rs calls the plain `cc` and `ar` commands (not the cc crate),
+          # so they always build for the host. Shim them, but only for that crate's C compile step.
+          SHIM="$RUNNER_TEMP/shim-${{ matrix.abi }}"
+          mkdir -p "$SHIM"
+          export NDK_CC="$TOOLBIN/${{ matrix.clang }}${ANDROID_API}-clang"
+          export NDK_AR="$TOOLBIN/llvm-ar"
+          cat > "$SHIM/cc" <<'SHIM_EOF'
+          #!/bin/sh
+          if [ "${CARGO_PKG_NAME:-}" = "slipstream-ffi" ]; then
+            for a in "$@"; do
+              if [ "$a" = "-c" ]; then exec "$NDK_CC" "$@"; fi
+            done
+          fi
+          exec /usr/bin/cc "$@"
+          SHIM_EOF
+          cat > "$SHIM/ar" <<'SHIM_EOF'
+          #!/bin/sh
+          if [ "${CARGO_PKG_NAME:-}" = "slipstream-ffi" ]; then exec "$NDK_AR" "$@"; fi
+          exec /usr/bin/ar "$@"
+          SHIM_EOF
+          chmod +x "$SHIM/cc" "$SHIM/ar"
+          export PATH="$SHIM:$PATH"
+          which cc ar
           LOG="$GITHUB_WORKSPACE/build-${{ matrix.abi }}.log"
           set +e
           cargo ndk -t "${{ matrix.abi }}" --platform "${ANDROID_API}" build --release -p slipstream-client > "$LOG" 2>&1
