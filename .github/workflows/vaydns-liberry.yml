@@ -1,0 +1,128 @@
+name: Build VayDNS core
+
+# Put this file at: .github/workflows/build-vaydns-core.yml
+# It builds libvaydns.so (the name VaydnsProtocol.BINARY expects) for every Android ABI
+# and lays the files out as app/src/main/jniLibs/<abi>/libvaydns.so.
+
+on:
+  workflow_dispatch:
+    inputs:
+      vaydns_repo:
+        description: "VayDNS repo (your fork or upstream)"
+        default: "net2share/vaydns"
+        required: true
+      vaydns_ref:
+        description: "Branch, tag or commit"
+        default: "main"
+        required: true
+      client_pkg:
+        description: "Go package of the client (the one that accepts -domain, -pubkey, -record-type ...)"
+        default: "./vaydns-client"
+        required: true
+  push:
+    tags:
+      - "core-v*"
+
+env:
+  VAYDNS_REPO: ${{ inputs.vaydns_repo || 'net2share/vaydns' }}
+  VAYDNS_REF: ${{ inputs.vaydns_ref || 'main' }}
+  CLIENT_PKG: ${{ inputs.client_pkg || './vaydns-client' }}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - abi: arm64-v8a
+            goarch: arm64
+          - abi: armeabi-v7a
+            goarch: arm
+            goarm: "7"
+          - abi: x86_64
+            goarch: amd64
+          - abi: x86
+            goarch: "386"
+
+    steps:
+      - name: Checkout VayDNS source
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.VAYDNS_REPO }}
+          ref: ${{ env.VAYDNS_REF }}
+          path: vaydns
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: vaydns/go.mod
+          cache-dependency-path: vaydns/go.sum
+
+      - name: Build
+        working-directory: vaydns
+        env:
+          # Pure-Go static binary: runs fine when Android executes it from nativeLibraryDir.
+          CGO_ENABLED: "0"
+          GOOS: linux
+          GOARCH: ${{ matrix.goarch }}
+          GOARM: ${{ matrix.goarm }}
+        run: |
+          mkdir -p ../out/${{ matrix.abi }}
+          go build -trimpath -ldflags="-s -w -buildid=" \
+            -o ../out/${{ matrix.abi }}/libvaydns.so ${{ env.CLIENT_PKG }}
+          file ../out/${{ matrix.abi }}/libvaydns.so
+          ls -lh ../out/${{ matrix.abi }}/libvaydns.so
+
+      # DnsCoreSupport.hasFlag() silently drops flags the core lacks, so check they exist here.
+      - name: Verify flags used by VaydnsProtocol.kt (x86_64 only, runnable on the runner)
+        if: matrix.abi == 'x86_64'
+        run: |
+          chmod +x out/x86_64/libvaydns.so
+          out/x86_64/libvaydns.so -h 2>&1 | tee help.txt || true
+          missing=0
+          for f in udp dot doh domain pubkey record-type max-qname-len idle-timeout rps utls \
+                   max-num-labels clientid-size keepalive udp-timeout listen; do
+            if ! grep -Eq -- "-$f( |$)" help.txt; then
+              echo "::warning::flag -$f not found in core help"
+              missing=1
+            fi
+          done
+          [ "$missing" = 0 ] && echo "All flags present."
+
+      - name: Upload ABI artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: vaydns-${{ matrix.abi }}
+          path: out/${{ matrix.abi }}/libvaydns.so
+          if-no-files-found: error
+
+  package:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dl
+
+      - name: Lay out jniLibs
+        run: |
+          for abi in arm64-v8a armeabi-v7a x86_64 x86; do
+            mkdir -p jniLibs/$abi
+            cp dl/vaydns-$abi/libvaydns.so jniLibs/$abi/libvaydns.so
+          done
+          find jniLibs -type f -exec ls -lh {} \;
+          (cd jniLibs && zip -r ../vaydns-jniLibs.zip .)
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: vaydns-jniLibs
+          path: |
+            jniLibs
+            vaydns-jniLibs.zip
+
+      - name: Attach to release (tag builds only)
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: vaydns-jniLibs.zip
