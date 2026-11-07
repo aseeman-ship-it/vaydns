@@ -7,6 +7,10 @@
 //
 //	soar-core -zone t.example.com -pubkey BASE64 -resolver 8.8.8.8,1.1.1.1 -listen 127.0.0.1:1836
 //
+// With -forward host:port the proxy does not speak SOCKS5 at all: every connection is piped, as raw TCP, to that
+// destination through the tunnel. That is what an SSH login behind Soar needs (the SSH client talks straight to
+// the port; the Soar server dials its own sshd).
+//
 // What it does NOT do on purpose:
 //   - listen on anything but loopback (the proxy has no login; whoever can reach it can use the tunnel);
 //   - UDP ASSOCIATE or BIND (Soar carries TCP streams only);
@@ -39,6 +43,58 @@ import (
 
 // version is set at build time: -ldflags "-X main.version=...".
 var version = "dev"
+
+// probeTarget is the destination of the throw-away stream that proves the tunnel is up. Opening a stream returns only
+// after the server has authenticated itself, so it is a real round trip whenever a session has to be (re)established.
+const probeTarget = "1.1.1.1:443"
+
+// probeWait is how long a SOCKS greeting waits for that proof before the connection is dropped unanswered.
+const probeWait = 10 * time.Second
+
+// tunnel is the Soar client plus what the SOCKS side needs from it: dialling, and a liveness check.
+type tunnel struct {
+	c        *soar.Client
+	mu       sync.Mutex
+	lastGood time.Time
+}
+
+func (t *tunnel) touch() {
+	t.mu.Lock()
+	t.lastGood = time.Now()
+	t.mu.Unlock()
+}
+
+// fresh reports whether the tunnel carried something a moment ago.
+func (t *tunnel) fresh() bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return !t.lastGood.IsZero() && time.Since(t.lastGood) < 5*time.Second
+}
+
+// dial opens a stream to addr through the tunnel, waiting at most wait for the session.
+func (t *tunnel) dial(ctx context.Context, addr string, wait time.Duration) (net.Conn, error) {
+	dctx, cancel := context.WithTimeout(ctx, wait)
+	defer cancel()
+	conn, err := t.c.DialContext(dctx, "tcp", addr)
+	if err == nil {
+		t.touch()
+	}
+	return conn, err
+}
+
+// alive makes sure a session with the server exists (handshaking if needed) by opening and closing one stream.
+// A tunnel that carried something in the last few seconds is taken as alive without asking again.
+func (t *tunnel) alive(ctx context.Context, wait time.Duration) error {
+	if t.fresh() {
+		return nil
+	}
+	conn, err := t.dial(ctx, probeTarget, wait)
+	if err != nil {
+		return err
+	}
+	_ = conn.Close()
+	return nil
+}
 
 // SOCKS5 reply codes (RFC 1928).
 const (
@@ -79,6 +135,7 @@ func run() error {
 		discovery = flag.Bool("discovery", false, "also discover resolvers that carry the tunnel")
 		country   = flag.String("country", "", "country code for the discovery lists, e.g. IR")
 		dialWait  = flag.Duration("dial-timeout", 30*time.Second, "how long a SOCKS CONNECT waits for the tunnel")
+		forward   = flag.String("forward", "", "host:port: pipe every connection there through the tunnel instead of speaking SOCKS5")
 		verbose   = flag.Bool("v", false, "debug log")
 		showVer   = flag.Bool("version", false, "print the version and exit")
 		resolvers listFlag
@@ -122,6 +179,16 @@ func run() error {
 	if err := checkLoopback(*listen); err != nil {
 		return err
 	}
+	fwd := strings.TrimSpace(*forward)
+	if fwd != "" {
+		h, p, err := net.SplitHostPort(fwd)
+		if err != nil || h == "" {
+			return fmt.Errorf("-forward must be host:port, not %q", fwd)
+		}
+		if n, err := strconv.Atoi(p); err != nil || n < 1 || n > 65535 {
+			return fmt.Errorf("-forward: bad port in %q", fwd)
+		}
+	}
 
 	level := slog.LevelInfo
 	if *verbose {
@@ -156,11 +223,12 @@ func run() error {
 
 	logger.Info("soar-core listening",
 		"addr", ln.Addr().String(), "zone", zoneName, "resolvers", len(rs),
-		"tcp", *tcpMode, "discovery", *discovery, "version", version)
+		"tcp", *tcpMode, "discovery", *discovery, "forward", fwd, "version", version)
 
 	// The handshake is lazy: start it now, so "tunnel ready" shows up in the log as soon as the zone, the key and a
 	// resolver agree, and the first real connection does not pay for it.
-	go warmUp(ctx, client, logger)
+	tun := &tunnel{c: client}
+	go warmUp(ctx, tun, logger)
 
 	for {
 		conn, err := ln.Accept()
@@ -172,7 +240,11 @@ func run() error {
 			time.Sleep(50 * time.Millisecond)
 			continue
 		}
-		go serve(ctx, conn, client, *dialWait, logger)
+		if fwd != "" {
+			go serveForward(ctx, conn, tun, fwd, *dialWait, logger)
+		} else {
+			go serve(ctx, conn, tun, *dialWait, logger)
+		}
 	}
 }
 
@@ -184,17 +256,13 @@ func dropTime(groups []string, a slog.Attr) slog.Attr {
 }
 
 // warmUp opens (and at once closes) one stream so the session handshake happens, retrying with a growing pause
-// until it works. Opening a stream returns only after the server has authenticated itself, so success means the
-// zone, the key and at least one resolver are right.
-func warmUp(ctx context.Context, c *soar.Client, log *slog.Logger) {
-	delay := 2 * time.Second
+// until it works. Success means the zone, the key and at least one resolver are right.
+func warmUp(ctx context.Context, t *tunnel, log *slog.Logger) {
+	delay := time.Second
 	for attempt := 1; ; attempt++ {
-		dctx, cancel := context.WithTimeout(ctx, 25*time.Second)
 		start := time.Now()
-		conn, err := c.DialContext(dctx, "tcp", "1.1.1.1:443")
-		cancel()
+		err := t.alive(ctx, 12*time.Second)
 		if err == nil {
-			_ = conn.Close()
 			log.Info("soar: tunnel ready (authenticated session)",
 				"attempt", attempt, "took", time.Since(start).Round(time.Millisecond).String())
 			return
@@ -208,14 +276,31 @@ func warmUp(ctx context.Context, c *soar.Client, log *slog.Logger) {
 			return
 		case <-time.After(delay):
 		}
-		if delay < 10*time.Second {
-			delay += 2 * time.Second
+		if delay < 5*time.Second {
+			delay += time.Second
 		}
 	}
 }
 
+// serveForward pipes one connection to the fixed destination through the tunnel (see -forward).
+func serveForward(ctx context.Context, conn net.Conn, t *tunnel, target string, dialWait time.Duration, log *slog.Logger) {
+	defer conn.Close()
+	defer func() {
+		if r := recover(); r != nil {
+			log.Error("panic in a connection handler", "panic", fmt.Sprint(r))
+		}
+	}()
+	up, err := t.dial(ctx, target, dialWait)
+	if err != nil {
+		log.Debug("tunnel dial failed", "target", target, "err", err.Error())
+		return
+	}
+	defer up.Close()
+	pipe(conn, up)
+}
+
 // serve handles one SOCKS5 client.
-func serve(ctx context.Context, conn net.Conn, c *soar.Client, dialWait time.Duration, log *slog.Logger) {
+func serve(ctx context.Context, conn net.Conn, t *tunnel, dialWait time.Duration, log *slog.Logger) {
 	defer conn.Close()
 	defer func() {
 		if r := recover(); r != nil {
@@ -224,7 +309,9 @@ func serve(ctx context.Context, conn net.Conn, c *soar.Client, dialWait time.Dur
 	}()
 
 	_ = conn.SetDeadline(time.Now().Add(30 * time.Second))
-	if err := socksNegotiate(conn); err != nil {
+	// The greeting is answered only when the tunnel is up: Last Net's own "is the tunnel alive" check is a SOCKS
+	// greeting, so it must fail while the tunnel is down instead of being answered by this local proxy alone.
+	if err := socksNegotiate(conn, func() error { return t.alive(ctx, probeWait) }); err != nil {
 		log.Debug("socks greeting failed", "err", err.Error())
 		return
 	}
@@ -237,9 +324,7 @@ func serve(ctx context.Context, conn net.Conn, c *soar.Client, dialWait time.Dur
 
 	// The deadline now has to cover the wait for the tunnel plus the reply.
 	_ = conn.SetDeadline(time.Now().Add(dialWait + 10*time.Second))
-	dctx, cancel := context.WithTimeout(ctx, dialWait)
-	up, err := c.DialContext(dctx, "tcp", addr)
-	cancel()
+	up, err := t.dial(ctx, addr, dialWait)
 	if err != nil {
 		log.Debug("tunnel dial failed", "target", addr, "err", err.Error())
 		_ = socksReply(conn, repHostUnreachable)
@@ -255,8 +340,9 @@ func serve(ctx context.Context, conn net.Conn, c *soar.Client, dialWait time.Dur
 }
 
 // socksNegotiate answers the method selection. "No authentication" is preferred; a client that only offers
-// username/password gets it accepted with any login (the listener is loopback-only).
-func socksNegotiate(conn net.Conn) error {
+// username/password gets it accepted with any login (the listener is loopback-only). ready runs before the answer:
+// when it fails the connection is dropped without one.
+func socksNegotiate(conn net.Conn, ready func() error) error {
 	var hdr [2]byte
 	if _, err := io.ReadFull(conn, hdr[:]); err != nil {
 		return err
@@ -277,19 +363,21 @@ func socksNegotiate(conn net.Conn) error {
 			userPass = true
 		}
 	}
-	switch {
-	case noAuth:
-		_, err := conn.Write([]byte{5, 0})
-		return err
-	case userPass:
-		if _, err := conn.Write([]byte{5, 2}); err != nil {
-			return err
-		}
-		return readUserPass(conn)
-	default:
+	if !noAuth && !userPass {
 		_, _ = conn.Write([]byte{5, 0xFF})
 		return errors.New("no acceptable SOCKS5 method offered")
 	}
+	if err := ready(); err != nil {
+		return fmt.Errorf("tunnel not ready: %w", err)
+	}
+	if noAuth {
+		_, err := conn.Write([]byte{5, 0})
+		return err
+	}
+	if _, err := conn.Write([]byte{5, 2}); err != nil {
+		return err
+	}
+	return readUserPass(conn)
 }
 
 // readUserPass reads an RFC 1929 login and accepts it.
