@@ -290,13 +290,17 @@ func serveForward(ctx context.Context, conn net.Conn, t *tunnel, target string, 
 			log.Error("panic in a connection handler", "panic", fmt.Sprint(r))
 		}
 	}()
+	start := time.Now()
 	up, err := t.dial(ctx, target, dialWait)
 	if err != nil {
 		log.Debug("tunnel dial failed", "target", target, "err", err.Error())
 		return
 	}
 	defer up.Close()
-	pipe(conn, up)
+	log.Debug("stream open", "target", target, "dial", time.Since(start).Round(time.Millisecond).String())
+	sent, got := pipe(conn, up)
+	log.Debug("stream closed", "target", target, "sent", sent, "received", got,
+		"lasted", time.Since(start).Round(time.Millisecond).String())
 }
 
 // serve handles one SOCKS5 client.
@@ -336,7 +340,10 @@ func serve(ctx context.Context, conn net.Conn, t *tunnel, dialWait time.Duration
 		return
 	}
 	_ = conn.SetDeadline(time.Time{})
-	pipe(conn, up)
+	opened := time.Now()
+	sent, got := pipe(conn, up)
+	log.Debug("stream closed", "target", addr, "sent", sent, "received", got,
+		"lasted", time.Since(opened).Round(time.Millisecond).String())
 }
 
 // socksNegotiate answers the method selection. "No authentication" is preferred; a client that only offers
@@ -467,9 +474,10 @@ func socksReply(conn net.Conn, code byte) error {
 
 type closeWriter interface{ CloseWrite() error }
 
-// pipe copies both ways until both directions end. When one direction ends the other gets 15 seconds to finish
-// (half-closed connections are normal), then both sides are closed so nothing lingers.
-func pipe(a, b net.Conn) {
+// pipe copies both ways until both directions end and returns how many bytes went a->b and b->a. When one
+// direction ends the other gets 15 seconds to finish (half-closed connections are normal), then both sides are
+// closed so nothing lingers.
+func pipe(a, b net.Conn) (toB, toA int64) {
 	done := make(chan struct{}, 2)
 	var once sync.Once
 	closeBoth := func() {
@@ -478,20 +486,26 @@ func pipe(a, b net.Conn) {
 			_ = b.Close()
 		})
 	}
-	cp := func(dst, src net.Conn) {
-		_, _ = io.Copy(dst, src)
-		if cw, ok := dst.(closeWriter); ok {
+	go func() {
+		toB, _ = io.Copy(b, a)
+		if cw, ok := b.(closeWriter); ok {
 			_ = cw.CloseWrite()
 		}
 		done <- struct{}{}
-	}
-	go cp(b, a)
-	go cp(a, b)
+	}()
+	go func() {
+		toA, _ = io.Copy(a, b)
+		if cw, ok := a.(closeWriter); ok {
+			_ = cw.CloseWrite()
+		}
+		done <- struct{}{}
+	}()
 	<-done
 	t := time.AfterFunc(15*time.Second, closeBoth)
 	<-done
 	t.Stop()
 	closeBoth()
+	return toB, toA
 }
 
 // parseKey reads the server's Ed25519 public key: 32 bytes as base64 (any variant) or as 64 hex characters.
