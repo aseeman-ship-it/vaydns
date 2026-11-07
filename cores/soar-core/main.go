@@ -11,6 +11,10 @@
 // destination through the tunnel. That is what an SSH login behind Soar needs (the SSH client talks straight to
 // the port; the Soar server dials its own sshd).
 //
+// With -stats 10s the core prints one line every 10 s about what crossed the tunnel in that window: how many
+// streams opened and how many failed (and why: timeout or other), how long an open took, how many bytes went each way.
+// It is the core's own view, independent of the app that uses it.
+//
 // What it does NOT do on purpose:
 //   - listen on anything but loopback (the proxy has no login; whoever can reach it can use the tunnel);
 //   - UDP ASSOCIATE or BIND (Soar carries TCP streams only);
@@ -35,6 +39,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -51,9 +56,100 @@ const probeTarget = "1.1.1.1:443"
 // probeWait is how long a SOCKS greeting waits for that proof before the connection is dropped unanswered.
 const probeWait = 10 * time.Second
 
+// stats counts what crossed the tunnel. Totals only grow; the -stats line prints the change since the last line.
+type stats struct {
+	dialOK      atomic.Int64 // streams the server confirmed
+	dialFail    atomic.Int64 // streams that failed for any reason
+	dialTimeout atomic.Int64 // ...of which: no answer in time
+	active      atomic.Int64 // streams open right now
+	sent        atomic.Int64 // bytes from the app into the tunnel
+	received    atomic.Int64 // bytes from the tunnel to the app
+
+	mu       sync.Mutex
+	okMs     int64 // sum of the open times of the confirmed streams in this window
+	okN      int64
+	maxMs    int64
+	lastErr  string
+	seenErrs map[string]bool
+}
+
+var st = &stats{seenErrs: map[string]bool{}}
+
+// shortErr keeps an error message readable in one log line.
+func shortErr(err error) string {
+	s := strings.ReplaceAll(err.Error(), "\n", " ")
+	if len(s) > 140 {
+		s = s[:140] + "..."
+	}
+	return s
+}
+
+// dialDone records the outcome of one dial. The first time a given error text is seen it is also logged at Info, so a
+// reason ("no route", "refused", "destination not allowed") is visible without -v.
+func (s *stats) dialDone(addr string, took time.Duration, err error, log *slog.Logger) {
+	if err == nil {
+		s.dialOK.Add(1)
+		s.mu.Lock()
+		s.okMs += took.Milliseconds()
+		s.okN++
+		if took.Milliseconds() > s.maxMs {
+			s.maxMs = took.Milliseconds()
+		}
+		s.mu.Unlock()
+		return
+	}
+	s.dialFail.Add(1)
+	if errors.Is(err, context.DeadlineExceeded) {
+		s.dialTimeout.Add(1)
+	}
+	msg := shortErr(err)
+	s.mu.Lock()
+	s.lastErr = msg
+	first := !s.seenErrs[msg] && len(s.seenErrs) < 8
+	if first {
+		s.seenErrs[msg] = true
+	}
+	s.mu.Unlock()
+	if first {
+		log.Info("soar: first dial failure of this kind", "err", msg, "after", took.Round(time.Millisecond).String())
+	}
+}
+
+// report prints one line with the change since the previous one.
+func (s *stats) report(log *slog.Logger, window time.Duration, prev *stats) {
+	ok, fail, to := s.dialOK.Load(), s.dialFail.Load(), s.dialTimeout.Load()
+	sent, got := s.sent.Load(), s.received.Load()
+	s.mu.Lock()
+	avg := int64(0)
+	if s.okN > 0 {
+		avg = s.okMs / s.okN
+	}
+	maxMs, last := s.maxMs, s.lastErr
+	s.okMs, s.okN, s.maxMs = 0, 0, 0
+	s.mu.Unlock()
+
+	dOK, dFail, dTo := ok-prev.dialOK.Load(), fail-prev.dialFail.Load(), to-prev.dialTimeout.Load()
+	dSent, dGot := sent-prev.sent.Load(), got-prev.received.Load()
+	prev.dialOK.Store(ok)
+	prev.dialFail.Store(fail)
+	prev.dialTimeout.Store(to)
+	prev.sent.Store(sent)
+	prev.received.Store(got)
+
+	log.Info("soar: stats",
+		"window", window.String(),
+		"opened", dOK, "failed", dFail, "timeout", dTo, "other_fail", dFail-dTo,
+		"open_avg_ms", avg, "open_max_ms", maxMs,
+		"active", s.active.Load(),
+		"up_bytes", dSent, "down_bytes", dGot,
+		"last_err", last,
+	)
+}
+
 // tunnel is the Soar client plus what the SOCKS side needs from it: dialling, and a liveness check.
 type tunnel struct {
 	c        *soar.Client
+	log      *slog.Logger
 	mu       sync.Mutex
 	lastGood time.Time
 }
@@ -73,9 +169,11 @@ func (t *tunnel) fresh() bool {
 
 // dial opens a stream to addr through the tunnel, waiting at most wait for the session.
 func (t *tunnel) dial(ctx context.Context, addr string, wait time.Duration) (net.Conn, error) {
+	start := time.Now()
 	dctx, cancel := context.WithTimeout(ctx, wait)
 	defer cancel()
 	conn, err := t.c.DialContext(dctx, "tcp", addr)
+	st.dialDone(addr, time.Since(start), err, t.log)
 	if err == nil {
 		t.touch()
 	}
@@ -136,6 +234,7 @@ func run() error {
 		country   = flag.String("country", "", "country code for the discovery lists, e.g. IR")
 		dialWait  = flag.Duration("dial-timeout", 30*time.Second, "how long a SOCKS CONNECT waits for the tunnel")
 		forward   = flag.String("forward", "", "host:port: pipe every connection there through the tunnel instead of speaking SOCKS5")
+		statsEvery = flag.Duration("stats", 0, "print one line of tunnel statistics this often (0 = off), e.g. 10s")
 		verbose   = flag.Bool("v", false, "debug log")
 		showVer   = flag.Bool("version", false, "print the version and exit")
 		resolvers listFlag
@@ -223,12 +322,28 @@ func run() error {
 
 	logger.Info("soar-core listening",
 		"addr", ln.Addr().String(), "zone", zoneName, "resolvers", len(rs),
-		"tcp", *tcpMode, "discovery", *discovery, "forward", fwd, "version", version)
+		"tcp", *tcpMode, "discovery", *discovery, "forward", fwd, "stats", statsEvery.String(), "version", version)
 
 	// The handshake is lazy: start it now, so "tunnel ready" shows up in the log as soon as the zone, the key and a
 	// resolver agree, and the first real connection does not pay for it.
-	tun := &tunnel{c: client}
+	tun := &tunnel{c: client, log: logger}
 	go warmUp(ctx, tun, logger)
+
+	if *statsEvery >= time.Second {
+		go func() {
+			prev := &stats{}
+			tick := time.NewTicker(*statsEvery)
+			defer tick.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-tick.C:
+					st.report(logger, *statsEvery, prev)
+				}
+			}
+		}()
+	}
 
 	for {
 		conn, err := ln.Accept()
@@ -298,7 +413,11 @@ func serveForward(ctx context.Context, conn net.Conn, t *tunnel, target string, 
 	}
 	defer up.Close()
 	log.Debug("stream open", "target", target, "dial", time.Since(start).Round(time.Millisecond).String())
+	st.active.Add(1)
 	sent, got := pipe(conn, up)
+	st.active.Add(-1)
+	st.sent.Add(sent)
+	st.received.Add(got)
 	log.Debug("stream closed", "target", target, "sent", sent, "received", got,
 		"lasted", time.Since(start).Round(time.Millisecond).String())
 }
@@ -341,7 +460,11 @@ func serve(ctx context.Context, conn net.Conn, t *tunnel, dialWait time.Duration
 	}
 	_ = conn.SetDeadline(time.Time{})
 	opened := time.Now()
+	st.active.Add(1)
 	sent, got := pipe(conn, up)
+	st.active.Add(-1)
+	st.sent.Add(sent)
+	st.received.Add(got)
 	log.Debug("stream closed", "target", addr, "sent", sent, "received", got,
 		"lasted", time.Since(opened).Round(time.Millisecond).String())
 }
