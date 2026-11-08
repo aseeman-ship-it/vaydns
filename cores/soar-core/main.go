@@ -416,8 +416,6 @@ func serveForward(ctx context.Context, conn net.Conn, t *tunnel, target string, 
 	st.active.Add(1)
 	sent, got := pipe(conn, up)
 	st.active.Add(-1)
-	st.sent.Add(sent)
-	st.received.Add(got)
 	log.Debug("stream closed", "target", target, "sent", sent, "received", got,
 		"lasted", time.Since(start).Round(time.Millisecond).String())
 }
@@ -463,8 +461,6 @@ func serve(ctx context.Context, conn net.Conn, t *tunnel, dialWait time.Duration
 	st.active.Add(1)
 	sent, got := pipe(conn, up)
 	st.active.Add(-1)
-	st.sent.Add(sent)
-	st.received.Add(got)
 	log.Debug("stream closed", "target", addr, "sent", sent, "received", got,
 		"lasted", time.Since(opened).Round(time.Millisecond).String())
 }
@@ -597,6 +593,19 @@ func socksReply(conn net.Conn, code byte) error {
 
 type closeWriter interface{ CloseWrite() error }
 
+// countWriter adds what it writes to a counter as it goes. The SSH login behind -forward is ONE stream that lives as
+// long as the tunnel, so counting bytes when a stream ends would show 0 until the tunnel is rebuilt.
+type countWriter struct {
+	w io.Writer
+	n *atomic.Int64
+}
+
+func (c countWriter) Write(p []byte) (int, error) {
+	n, err := c.w.Write(p)
+	c.n.Add(int64(n))
+	return n, err
+}
+
 // pipe copies both ways until both directions end and returns how many bytes went a->b and b->a. When one
 // direction ends the other gets 15 seconds to finish (half-closed connections are normal), then both sides are
 // closed so nothing lingers.
@@ -610,14 +619,14 @@ func pipe(a, b net.Conn) (toB, toA int64) {
 		})
 	}
 	go func() {
-		toB, _ = io.Copy(b, a)
+		toB, _ = io.Copy(countWriter{w: b, n: &st.sent}, a)
 		if cw, ok := b.(closeWriter); ok {
 			_ = cw.CloseWrite()
 		}
 		done <- struct{}{}
 	}()
 	go func() {
-		toA, _ = io.Copy(a, b)
+		toA, _ = io.Copy(countWriter{w: a, n: &st.received}, b)
 		if cw, ok := a.(closeWriter); ok {
 			_ = cw.CloseWrite()
 		}
